@@ -1,0 +1,477 @@
+name: Build Zefari
+on:
+  push: { branches: [ main, master ] }
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { java-version: '21', distribution: 'temurin' }
+
+      - name: Create project
+        run: |
+          mkdir -p src/main/java/com/zefari/client/mixin src/main/java/com/zefari/client/modules src/main/resources/assets/zefari/shaders
+
+          cat > build.gradle <<'EOF'
+          plugins { id 'fabric-loom' version '1.9-SNAPSHOT' }
+          version = '1.0.0'
+          group = 'com.zefari.client'
+          base { archivesName = 'zefari-client' }
+          repositories { maven { url 'https://maven.fabricmc.net/' }; mavenCentral() }
+          dependencies {
+              minecraft 'com.mojang:minecraft:1.21.1'
+              mappings 'net.fabricmc:yarn:1.21.1+build.3:v2'
+              modImplementation 'net.fabricmc:fabric-loader:0.16.5'
+              modImplementation 'net.fabricmc.fabric-api:fabric-api:0.115.0+1.21.1'
+          }
+          processResources { filesMatching('fabric.mod.json') { expand 'version': version } }
+          tasks.withType(JavaCompile).configureEach { it.options.release = 21 }
+          EOF
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { maven { url 'https://maven.fabricmc.net/' }; mavenCentral(); gradlePluginPortal() } }
+          rootProject.name = 'zefari-client'
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1, "id": "zefari", "version": "1.0.0", "name": "Zefari Client", "environment": "client",
+            "entrypoints": { "client": ["com.zefari.client.ZefariClient"] },
+            "mixins": ["zefari.mixins.json"],
+            "depends": { "fabricloader": ">=0.16.0", "fabric-api": "*", "minecraft": "~1.21.1", "java": ">=21" }
+          }
+          EOF
+
+          cat > src/main/resources/zefari.mixins.json <<'EOF'
+          {
+            "required": true, "package": "com.zefari.client.mixin", "compatibilityLevel": "JAVA_21",
+            "client": ["GameRendererMixin", "HeldItemRendererMixin", "WorldRendererMixin"],
+            "injectors": { "defaultRequire": 1 }
+          }
+          EOF
+
+          cat > src/main/resources/assets/zefari/shaders/glow.frag <<'EOF'
+          #version 150
+          uniform sampler2D DiffuseSampler;
+          uniform float Time;
+          uniform vec4 Color;
+          in vec2 texCoord;
+          out vec4 fragColor;
+          void main() {
+              vec4 tex = texture(DiffuseSampler, texCoord);
+              float pulse = (sin(Time * 5.0) + 1.0) * 0.5;
+              fragColor = mix(tex, Color, pulse * 0.3);
+          }
+          EOF
+
+          cat > src/main/java/com/zefari/client/ZefariClient.java <<'EOF'
+          package com.zefari.client;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+          import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import org.lwjgl.glfw.GLFW;
+          import java.awt.Color;
+          import java.util.ArrayList;
+          import java.util.List;
+          import com.zefari.client.modules.*;
+
+          public class ZefariClient implements ClientModInitializer {
+              public static final MinecraftClient mc = MinecraftClient.getInstance();
+              public static List<Module> modules = new ArrayList<>();
+              public static KeyBinding guiKey, hudKey;
+              public static MainGui gui;
+              public static Color themeColor = new Color(120, 0, 255);
+              public static boolean hudEnabled = true;
+              public static long lastTick = System.currentTimeMillis();
+              public static float tps = 20.0f;
+
+              @Override public void onInitializeClient() {
+                  gui = new MainGui();
+                  guiKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.zefari.gui", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_RIGHT_SHIFT, "Zefari"));
+                  hudKey = KeyBindingHelper.registerKeyBinding(new KeyBinding("key.zefari.hud", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_RIGHT_CONTROL, "Zefari"));
+                  
+                  modules.add(new Aura());
+                  modules.add(new TargetESP());
+                  modules.add(new ElytraHelper());
+                  modules.add(new WorldTweaks());
+                  modules.add(new ItemFov());
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      while (guiKey.wasPressed()) client.setScreen(gui);
+                      while (hudKey.wasPressed() && client.currentScreen == null) hudEnabled = !hudEnabled;
+                      if (client.player == null) return;
+                      for (Module m : modules) if (m.enabled) m.onTick();
+
+                      // TPS Calculation
+                      long now = System.currentTimeMillis();
+                      long diff = now - lastTick;
+                      if (diff > 0) tps = Math.min(20.0f, 1000.0f / diff);
+                      lastTick = now;
+                  });
+
+                  WorldRenderEvents.AFTER_ENTITIES.register(context -> {
+                      if (mc.world == null || mc.player == null) return;
+                      for (Module m : modules) if (m.enabled && m instanceof Module.RenderModule r) r.onRender(context.matrixStack(), context.tickDelta());
+                  });
+
+                  HudRenderCallback.EVENT.register((drawContext, tickDelta) -> {
+                      if (!hudEnabled || mc.player == null) return;
+                      String ip = mc.getCurrentServerEntry() != null ? mc.getCurrentServerEntry().address : "Singleplayer";
+                      String text = "§lZEFARI §r| " + mc.player.getName().getString() + " | " + ip + " | " + mc.getCurrentFps() + " FPS | " + String.format("%.1f", tps) + " TPS";
+                      drawContext.drawText(mc.textRenderer, text, 5, 5, themeColor.getRGB(), true);
+                  });
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/zefari/client/modules/Module.java <<'EOF'
+          package com.zefari.client.modules;
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.minecraft.client.util.math.MatrixStack;
+          public abstract class Module {
+              public final String name, category;
+              public boolean enabled;
+              public final List<Setting> settings = new ArrayList<>();
+              public Module(String n, String c) { name = n; category = c; }
+              public void toggle() { enabled = !enabled; }
+              public abstract void onTick();
+              public interface RenderModule { void onRender(MatrixStack matrices, float tickDelta); }
+          }
+          EOF
+
+          cat > src/main/java/com/zefari/client/modules/Setting.java <<'EOF'
+          package com.zefari.client.modules;
+          public class Setting {
+              public String name; public float value, min, max;
+              public boolean isCheckbox, boolValue;
+              public String modeValue; public String[] modes;
+              public Setting(String n, float val, float min, float max) { this.name = n; this.value = val; this.min = min; this.max = max; }
+              public Setting(String n, boolean val) { this.name = n; this.boolValue = val; this.isCheckbox = true; }
+              public Setting(String n, String[] m) { this.name = n; this.modes = m; this.modeValue = m[0]; }
+          }
+          EOF
+
+          cat > src/main/java/com/zefari/client/modules/Aura.java <<'EOF'
+          package com.zefari.client.modules;
+          import com.zefari.client.ZefariClient;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.LivingEntity;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.item.SwordItem;
+          import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.math.MathHelper;
+
+          public class Aura extends Module {
+              public Setting reach = new Setting("Reach", 3.0f, 1f, 8f);
+              public Setting wallRange = new Setting("WallRange", 3.0f, 0f, 8f);
+              public Setting wallDetect = new Setting("WallDetect", true);
+              public Setting onlyWeapon = new Setting("OnlyWeapon", true);
+              public Setting rotation = new Setting("Rotation", new String[]{"Track", "Polar", "Vulcan", "Legit"});
+              public Setting minYaw = new Setting("MinYawStep", 25f, 1f, 180f);
+              public Setting maxYaw = new Setting("MaxYawStep", 35f, 1f, 180f);
+              public Setting aimedPitch = new Setting("AimedPitchStep", 2f, 1f, 90f);
+              public Setting maxPitch = new Setting("MaxPitchStep", 4f, 1f, 90f);
+              public Setting pitchAccel = new Setting("PitchAccelerate", 1.65f, 1f, 10f);
+              public static Entity target = null;
+              private int cooldown = 0;
+              public static float rotYaw = 0, rotPitch = 0;
+
+              public Aura() { super("Aura", "Combat"); 
+                  settings.add(reach); settings.add(wallRange); settings.add(wallDetect); settings.add(onlyWeapon); settings.add(rotation); settings.add(minYaw); settings.add(maxYaw); settings.add(aimedPitch); settings.add(maxPitch); settings.add(pitchAccel);
+              }
+
+              @Override public void onTick() {
+                  var mc = ZefariClient.mc;
+                  if (mc.player == null || mc.world == null) return;
+                  if (cooldown > 0) { cooldown--; return; }
+                  if (onlyWeapon.boolValue && !(mc.player.getMainHandStack().getItem() instanceof SwordItem)) return;
+
+                  Entity best = null; double bestDist = reach.value * reach.value;
+                  for (Entity e : mc.world.getEntities()) {
+                      if (!(e instanceof PlayerEntity p) || p == mc.player || !p.isAlive()) continue;
+                      if (wallDetect.boolValue && !mc.player.canSee(p) && wallRange.value == 0) continue;
+                      double d = mc.player.squaredDistanceTo(p);
+                      if (d < bestDist) { bestDist = d; best = p; }
+                  }
+                  target = best;
+                  if (target == null) return;
+
+                  double dx = target.getX() - mc.player.getX(), dz = target.getZ() - mc.player.getZ();
+                  double dy = target.getY() + target.getStandingEyeHeight() / 2.0 - (mc.player.getY() + mc.player.getStandingEyeHeight());
+                  double dist = Math.sqrt(dx * dx + dz * dz);
+                  float tYaw = (float) Math.toDegrees(Math.atan2(dz, dx)) - 90f;
+                  float tPitch = (float) -Math.toDegrees(Math.atan2(dy, dist));
+
+                  if (rotation.modeValue.equals("Legit")) {
+                      float yDiff = MathHelper.wrapDegrees(tYaw - rotYaw);
+                      float pDiff = tPitch - rotPitch;
+                      rotYaw += Math.max(-maxYaw.value, Math.min(maxYaw.value, yDiff));
+                      rotPitch += Math.max(-maxPitch.value, Math.min(maxPitch.value, pDiff));
+                  } else {
+                      rotYaw = tYaw; rotPitch = tPitch;
+                  }
+                  mc.player.setYaw(rotYaw); mc.player.setPitch(rotPitch);
+                  mc.player.networkHandler.sendPacket(new PlayerMoveC2SPacket.LookAndOnGround(rotYaw, rotPitch, mc.player.isOnGround()));
+                  mc.player.swingHand(Hand.MAIN_HAND);
+                  mc.interactionManager.attackEntity(mc.player, (LivingEntity) target);
+                  cooldown = 3;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/zefari/client/modules/TargetESP.java <<'EOF'
+          package com.zefari.client.modules;
+          import com.zefari.client.ZefariClient;
+          import net.minecraft.client.render.BufferBuilder;
+          import net.minecraft.client.render.Tessellator;
+          import net.minecraft.client.render.VertexFormat;
+          import net.minecraft.client.render.VertexFormats;
+          import net.minecraft.client.util.math.MatrixStack;
+          import net.minecraft.util.math.RotationAxis;
+          import net.minecraft.util.math.Vec3d;
+
+          public class TargetESP extends Module implements Module.RenderModule {
+              public Setting mode = new Setting("Mode", new String[]{"Ghost", "GhostV2", "Nurik"});
+              private float spin = 0;
+              public TargetESP() { super("TargetESP", "Render"); settings.add(mode); }
+
+              @Override public void onTick() { spin += 3.0f; }
+
+              @Override public void onRender(MatrixStack matrices, float tickDelta) {
+                  if (Aura.target == null || ZefariClient.mc.player == null) return;
+                  Vec3d pos = Aura.target.getLerpedPos(tickDelta);
+                  double x = pos.x - ZefariClient.mc.gameRenderer.getCamera().getPos().x;
+                  double y = pos.y - ZefariClient.mc.gameRenderer.getCamera().getPos().y;
+                  double z = pos.z - ZefariClient.mc.gameRenderer.getCamera().getPos().z;
+                  matrices.push(); matrices.translate(x, y + 1.0, z);
+                  matrices.multiply(RotationAxis.POSITIVE_Y.rotationDegrees(spin));
+                  int color = ZefariClient.themeColor.getRGB();
+
+                  if (mode.modeValue.equals("Ghost")) {
+                      for (int i = 0; i < 6; i++) {
+                          float a = (float)(i * Math.PI / 3);
+                          float px = (float)Math.cos(a) * 0.8f, pz = (float)Math.sin(a) * 0.8f;
+                          BufferBuilder bb = Tessellator.getInstance().begin(VertexFormat.DrawMode.DEBUG_LINES, VertexFormats.POSITION_COLOR);
+                          bb.vertex(matrices.peek().getPositionMatrix(), px, -0.5f, pz).color(color);
+                          bb.vertex(matrices.peek().getPositionMatrix(), px*1.5f, 1.0f, pz*1.5f).color(color);
+                          Tessellator.getInstance().draw();
+                      }
+                  } else if (mode.modeValue.equals("GhostV2")) {
+                      for (int i = 0; i < 4; i++) {
+                          BufferBuilder bb = Tessellator.getInstance().begin(VertexFormat.DrawMode.DEBUG_LINE_STRIP, VertexFormats.POSITION_COLOR);
+                          for (int j = 0; j <= 360; j += 15) {
+                              float a = (float)Math.toRadians(j);
+                              bb.vertex(matrices.peek().getPositionMatrix(), (float)Math.cos(a)*(0.6f+i*0.2f), i*0.3f, (float)Math.sin(a)*(0.6f+i*0.2f)).color(color);
+                          }
+                          Tessellator.getInstance().draw();
+                      }
+                  } else if (mode.modeValue.equals("Nurik")) {
+                      for (int i = 0; i < 3; i++) {
+                          float a = (float)(i * Math.PI * 2 / 3) + (spin * 0.5f);
+                          float px = (float)Math.cos(a) * 1.2f, pz = (float)Math.sin(a) * 1.2f;
+                          BufferBuilder bb = Tessellator.getInstance().begin(VertexFormat.DrawMode.DEBUG_LINES, VertexFormats.POSITION_COLOR);
+                          bb.vertex(matrices.peek().getPositionMatrix(), px, 1.5f, pz).color(color);
+                          bb.vertex(matrices.peek().getPositionMatrix(), px, -0.5f, pz).color(color);
+                          Tessellator.getInstance().draw();
+                      }
+                  }
+                  matrices.pop();
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/zefari/client/modules/ElytraHelper.java <<'EOF'
+          package com.zefari.client.modules;
+          import com.zefari.client.ZefariClient;
+          import net.minecraft.item.Items;
+          import net.minecraft.util.Hand;
+
+          public class ElytraHelper extends Module {
+              public Setting delay = new Setting("Delay (ms)", 400f, 50f, 1000f);
+              public Setting mode = new Setting("Mode", new String[]{"Normal", "Silent"});
+              private long lastFire = 0;
+              public ElytraHelper() { super("ElytraHelper", "Misc"); settings.add(delay); settings.add(mode); }
+
+              @Override public void onTick() {
+                  var p = ZefariClient.mc.player;
+                  if (p == null || !p.isFallFlying()) return;
+                  if (System.currentTimeMillis() - lastFire > delay.value) {
+                      int fSlot = -1;
+                      for (int i = 0; i < 9; i++) if (p.getInventory().getStack(i).getItem() == Items.FIREWORK_ROCKET) { fSlot = i; break; }
+                      if (fSlot != -1) {
+                          int old = p.getInventory().selectedSlot;
+                          p.getInventory().selectedSlot = fSlot;
+                          ZefariClient.mc.interactionManager.interactItem(p, Hand.MAIN_HAND);
+                          if (mode.modeValue.equals("Normal")) p.getInventory().selectedSlot = old;
+                          lastFire = System.currentTimeMillis();
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/zefari/client/modules/ItemFov.java <<'EOF'
+          package com.zefari.client.modules;
+          public class ItemFov extends Module {
+              public Setting fov = new Setting("FOV", 150f, 30f, 200f);
+              public ItemFov() { super("ItemFov", "Render"); settings.add(fov); }
+              @Override public void onTick() {}
+          }
+          EOF
+
+          cat > src/main/java/com/zefari/client/modules/WorldTweaks.java <<'EOF'
+          package com.zefari.client.modules;
+          public class WorldTweaks extends Module {
+              public Setting color = new Setting("Color", new String[]{"Red", "Blue", "Green", "Purple"});
+              public WorldTweaks() { super("WorldTweaks", "Render"); settings.add(color); }
+              @Override public void onTick() {}
+          }
+          EOF
+
+          cat > src/main/java/com/zefari/client/MainGui.java <<'EOF'
+          package com.zefari.client;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.text.Text;
+          import com.zefari.client.modules.Module;
+
+          public class MainGui extends Screen {
+              private int x = 60, y = 60, dragX, dragY;
+              private String selectedCat = "Combat";
+              public MainGui() { super(Text.literal("Zefari")); }
+
+              @Override public void render(DrawContext ctx, int mx, int my, float delta) {
+                  net.minecraft.client.MinecraftClient.getInstance().gameRenderer.renderBlur(delta); // Shader/Blur hissi
+                  ctx.fill(0, 0, width, height, 0x66000000);
+                  int w = 350, h = 250;
+                  ctx.fill(x - 1, y - 1, x + w + 1, y + h + 1, 0xFF000000);
+                  ctx.fill(x, y, x + w, y + h, 0xFF101015);
+                  ctx.fill(x, y, x + w, y + 25, ZefariClient.themeColor.getRGB() | 0xFF000000);
+                  ctx.drawText(textRenderer, "ZEFARI", x + 10, y + 8, 0xFFFFFFFF, true);
+                  String[] cats = {"Combat", "Render", "Movement", "Misc", "Client"};
+                  int cy = y + 35;
+                  for (String c : cats) {
+                      ctx.fill(x + 5, cy, x + 80, cy + 20, c.equals(selectedCat) ? 0xFF202025 : 0x00000000);
+                      ctx.drawText(textRenderer, c, x + 10, cy + 6, c.equals(selectedCat) ? ZefariClient.themeColor.getRGB() : 0xFFAAAAAA, false);
+                      cy += 22;
+                  }
+                  int myY = y + 35;
+                  for (Module m : ZefariClient.modules) {
+                      if (m.category.equals(selectedCat)) {
+                          ctx.fill(x + 85, myY, x + w - 5, myY + 20, m.enabled ? (ZefariClient.themeColor.getRGB() & 0x00FFFFFF) | 0x44000000 : 0xFF15151A);
+                          ctx.drawText(textRenderer, m.name, x + 90, myY + 6, m.enabled ? 0xFFFFFFFF : 0xFFAAAAAA, false);
+                          int sy = myY + 22;
+                          if (m.enabled) {
+                              for (var s : m.settings) {
+                                  if (s.isCheckbox) { ctx.drawText(textRenderer, s.name, x + 95, sy, 0xFFAAAAAA, false); ctx.fill(x + w - 25, sy, x + w - 15, sy + 10, s.boolValue ? ZefariClient.themeColor.getRGB() : 0xFF333333); sy += 12; }
+                                  else if (s.modes != null) { ctx.drawText(textRenderer, s.name + ": " + s.modeValue, x + 95, sy, 0xFFAAAAAA, false); sy += 12; }
+                                  else { ctx.drawText(textRenderer, s.name + ": " + String.format("%.1f", s.value), x + 95, sy, 0xFFAAAAAA, false); sy += 12; }
+                              }
+                          }
+                          myY = sy + 5;
+                      }
+                  }
+                  super.render(ctx, mx, my, delta);
+              }
+              @Override public boolean mouseClicked(double mx, double my, int b) {
+                  if (b == 0) {
+                      if (mx >= x && mx <= x + 350 && my >= y && my <= y + 25) { dragX = (int)mx - x; dragY = (int)my - y; return true; }
+                      String[] cats = {"Combat", "Render", "Movement", "Misc", "Client"};
+                      int cy = y + 35;
+                      for (String c : cats) { if (mx >= x + 5 && mx <= x + 80 && my >= cy && my <= cy + 20) { selectedCat = c; return true; } cy += 22; }
+                  }
+                  return super.mouseClicked(mx, my, b);
+              }
+              @Override public boolean mouseDragged(double mx, double my, int b, double dx, double dy) { if (dragX > 0) { x = (int)mx - dragX; y = (int)my - dragY; return true; } return super.mouseDragged(mx, my, b, dx, dy); }
+              @Override public boolean mouseReleased(double mx, double my, int b) { dragX = -1; return super.mouseReleased(mx, my, b); }
+              @Override public boolean shouldPause() { return false; }
+          }
+          EOF
+
+          cat > src/main/java/com/zefari/client/mixin/GameRendererMixin.java <<'EOF'
+          package com.zefari.client.mixin;
+          import com.zefari.client.ZefariClient;
+          import net.minecraft.client.render.GameRenderer;
+          import net.minecraft.client.render.Camera;
+          import net.minecraft.client.render.Fog;
+          import net.minecraft.client.render.FogShape;
+          import org.joml.Vector4f;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          @Mixin(GameRenderer.class)
+          public class GameRendererMixin {
+              @Inject(method = "getFog", at = @At("RETURN"), cancellable = true)
+              private void onGetFog(Camera camera, float viewDistance, boolean thickFog, float tickDelta, CallbackInfoReturnable<Fog> cir) {
+                  var m = ZefariClient.modules.stream().filter(mod -> mod.name.equals("WorldTweaks") && mod.enabled).findFirst().orElse(null);
+                  if (m != null) {
+                      var c = ZefariClient.themeColor;
+                      cir.setReturnValue(new Fog(new Vector4f(c.getRed()/255f, c.getGreen()/255f, c.getBlue()/255f, 1f), 0f, viewDistance, FogShape.SPHERE));
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/zefari/client/mixin/HeldItemRendererMixin.java <<'EOF'
+          package com.zefari.client.mixin;
+          import com.zefari.client.ZefariClient;
+          import net.minecraft.client.render.item.HeldItemRenderer;
+          import net.minecraft.client.util.math.MatrixStack;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.SwordItem;
+          import net.minecraft.client.network.AbstractClientPlayerEntity;
+          import net.minecraft.util.Hand;
+          import net.minecraft.client.render.VertexConsumerProvider;
+
+          @Mixin(HeldItemRenderer.class)
+          public class HeldItemRendererMixin {
+              @Inject(method = "renderFirstPersonItem", at = @At("HEAD"))
+              private void onRenderItem(AbstractClientPlayerEntity player, float tickDelta, float pitch, Hand hand, float swingProgress, ItemStack item, float equipProgress, MatrixStack matrices, VertexConsumerProvider vertexConsumers, int light, CallbackInfo ci) {
+                  var m = ZefariClient.modules.stream().filter(mod -> mod.name.equals("ItemFov") && mod.enabled).findFirst().orElse(null);
+                  if (m != null && item.getItem() instanceof SwordItem) {
+                      float scale = 1.0f + (m.settings.get(0).value / 100f);
+                      matrices.scale(scale, scale, scale);
+                      matrices.translate(0, 0, 0.5f);
+                  }
+              }
+          }
+          EOF
+          
+          cat > src/main/java/com/zefari/client/mixin/WorldRendererMixin.java <<'EOF'
+          package com.zefari.client.mixin;
+          import org.spongepowered.asm.mixin.Mixin;
+          @Mixin(net.minecraft.client.render.WorldRenderer.class)
+          public class WorldRendererMixin {}
+          EOF
+
+          find . -name "*.java" -exec sed -i 's/^          //' {} \;
+          find . -name "*.gradle" -exec sed -i 's/^          //' {} \;
+          find . -name "*.json" -exec sed -i 's/^          //' {} \;
+          find . -name "*.frag" -exec sed -i 's/^          //' {} \;
+
+      - name: Gradle wrapper
+        run: gradle wrapper --gradle-version 8.11
+
+      - name: Build
+        run: ./gradlew build --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zefari-client-jar
+          path: build/libs/*.jar
